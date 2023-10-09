@@ -1,0 +1,273 @@
+#Prepared by Daniel Martin: dm360x@outlook.com
+#Copyright of Daniel Martin: dm360x@outlook.com
+
+install.packages("faux") #needed for rnorm_pre function
+install.packages("matrixcalc") #for testing characteristics of matrix
+install.packages("Matrix") #for calculating nearest PD matrix for Z-scores
+install.packages("corrplot")
+install.packages("beepr")
+install.packages("tidyverse") #for expand function and ggplot2
+install.packages("data.table") #for saving large files to disc
+install.packages("filematrix")
+install.packages("gtable")
+install.packages("colorspace")
+install.packages("car")
+
+install.packages("doParallel")
+install.packages("foreach")
+
+install.packages("plyr")
+install.packages("RColorBrewer")
+install.packages("digest")
+install.packages("reshape2")
+
+library(faux)
+library(matrixcalc)
+library(Matrix)
+library(beepr)
+library(data.table)
+library(ggplot2)
+library(filematrix)
+library(car)
+library(corrplot)
+
+library('foreach')
+library('doParallel')
+
+Sys.sleep(3)
+
+#clear all variables
+rm(list = ls())
+gc()
+Sys.sleep(2)
+
+##STEP 1: Load raw correlation table and display 
+#Correlation table must have NA for missing correlations
+#Check the separator!!
+work.dir = "C:/Users/dm360/OneDrive/R Shiny/Example R Code"
+setwd(work.dir)
+getwd()
+data.raw = read.csv(
+  "corr.csv",
+  header = TRUE,
+  sep = ",",
+  fileEncoding = "UTF-8-BOM"
+)
+data.raw
+mtx.raw = as.matrix(data.raw)
+rownames(mtx.raw) = colnames(mtx.raw)
+##Display lower triangle of raw data matrix
+lower <- round(mtx.raw, 2)
+lower[upper.tri(mtx.raw)] <- ""
+lower <- as.data.frame(lower)
+lower
+
+
+#Define c.names - Assign and display variable names to a vector
+c.names = colnames(mtx.raw)
+for (i in 1:length(c.names)){
+  print(paste(i, ":",c.names[i]))
+}
+
+##On assumption that matrix is symmetrical fetch co-ords of NAs
+raw.lwr = lower
+mval = data.frame(matrix(ncol = 2, nrow = 0))
+colnames(mval) = c('cols', 'rows')
+
+i = 1
+for (cols in 1:ncol(raw.lwr)) {
+  for (rows in 1:nrow(raw.lwr)) {
+    if (is.na(raw.lwr[cols, rows])) {
+      mval[i, 1] = rows
+      mval[i, 2] = cols
+      i = i + 1
+    }
+    mv = i - 1
+  }
+}
+mrows = mval$rows
+mrows = unique(mrows)
+mval
+print(paste("No. of missing correlations: ",mv))
+print(paste("No. of vars with missing correlations: ",length(mrows)))
+
+mvar = data.frame(matrix(NA,ncol = 3, nrow = 0))
+colnames(mvar) = c('row', 'nvar', 'name')
+j=1
+for (i in mrows) {
+  mvar[j,"row"] = i
+  mvar[j,"nvar"] = length(which(mval$rows == i))
+  mvar[j,"name"] = colnames(lower[i])
+  j=j+1
+}
+mvar
+
+#v2: PARALLEL Produce the correlation matrices (15,000 = 4min)
+#Define a correlation range to impute, number of corr matrices (models) and sample size n (teams)
+cor.min = 0.1
+cor.max = 0.4
+limit.vif = 100
+#limit.vif = 1.24 works
+mod.tot = 100
+
+#Define the number of decimal places (deci) the correlations should have (defines granularity)
+deci = 3
+#Calculate a related variable to generate the correlations (pts) within sample function below
+pts = 10 ^ deci
+
+#Define sample data consistency parameter
+diff = 0.01
+diffcount = 0
+no.pd = 0
+
+#Produce the correlation matrices x
+#Create storage array
+m.names = as.character(1:mod.tot)
+stornew.arr = array(
+  0,
+  dim = c(ncol(mtx.raw), ncol(mtx.raw), mod.tot),
+  dimnames = list(c.names, c.names, m.names)
+)
+
+if(exists("storarr.obj")) {rm(storarr.obj)}
+gc()
+Sys.sleep(2)
+#Initiate Parallel backend
+no_cores <- detectCores() - 1
+#no_cores = 14 @ESADE = 87%
+#Note that too many cores use up too much memory and cause a crash (out of memory)
+t1 = Sys.time()
+#Setup parallel cluster
+cl = makeCluster(no_cores)
+registerDoParallel(cl)
+print(paste("No. of available cores:", detectCores()))
+print(paste("No. of parallel cores initiated:", no_cores))
+print(Sys.time())
+
+#need to include packages that called functions rely on
+storarr.obj = foreach (h = 1:mod.tot,.packages = c("faux","matrixcalc","Matrix","car"),.inorder = TRUE
+) %dopar%
+  {
+    
+      obj.mat = mtx.raw
+      vifs = limit.vif+1
+      loop_limit = limit.vif
+      loop_max = 1
+      
+      while (any(vifs > loop_limit)) {
+        
+        for (i in 1:nrow(mvar))
+        {
+          imp = matrix(sample(((cor.min * pts):(cor.max * pts)) / pts, mvar$nvar[i], replace = TRUE), ncol = mvar$nvar[i])
+          colz.nos = mval$cols[mval$rows == mvar$row[i]]
+          cntr = 1
+          for (j in colz.nos)
+          {
+            obj.mat[mvar$row[i], j] = imp[cntr]
+            obj.mat[j, mvar$row[i]] = imp[cntr]
+            cntr = cntr + 1
+          }
+        }
+        
+        if (isFALSE(is.positive.definite(obj.mat, tol = 1e-8)))
+        {
+          old.mat = obj.mat
+          new.mat = nearPD(obj.mat, corr = TRUE, keepDiag = TRUE)$mat
+          obj.mat = as.matrix(new.mat)
+          no.pd = no.pd + 1
+          
+          #Check how far away the matrix is from the original input matrix
+          diff.mat = round(obj.mat - old.mat, 5)
+          if (any(diff.mat > diff))
+          {
+            diffcount = diffcount + 1
+          }
+        }
+        
+        #Run a VIF test on the matrix with the imputed values
+        test.mat = obj.mat
+        
+        #Create a matrix of sample data for the input vars
+        sample.mat = (
+          rnorm_multi(
+            1000,
+            ncol(test.mat),
+            mu = 0,
+            sd = 1,
+            r = test.mat,
+            c.names,
+            empirical = TRUE,
+            as.matrix = TRUE
+          )
+        )
+        
+        vifs = vector()
+        lreg.test = lm(out1 ~ ., data = as.data.frame(sample.mat))
+        vifs = vif(lreg.test)
+        loop_max = loop_max + 1
+        
+        if (loop_max >= 10)
+        {
+          loop_limit = loop_limit + 0.01
+          loop_max = 1
+          }
+        
+      }
+      
+     
+      return(obj.mat)
+    #END of FOREACH Parallel loop
+  }
+
+#Stop Parallel Cluster
+stopCluster(cl)
+stopImplicitCluster()
+t2 = Sys.time()
+beep()
+
+#Convert parallel object to array
+stornew.arr = array(unlist(storarr.obj),dim = c(dim(storarr.obj[[1]])[1],dim(storarr.obj[[1]])[2],length(storarr.obj)))
+colnames(stornew.arr) = colnames(mtx.raw)
+rownames(stornew.arr) = colnames(mtx.raw)
+if(exists("storarr.obj") & exists("stornew.arr")) {rm(storarr.obj)}
+
+stornew.arr[,,1]
+stornew.arr[,,mod.tot]
+#Check that number of models is as expected...
+mod.tot
+
+#Make corrplot
+corrplot(
+  stornew.arr[,,1],
+  method = 'color',
+  order = 'original',
+  type = 'lower',
+  addCoef.col = 'black',
+  number.cex = 0.5,
+  diag = FALSE, 
+  title ="plot_sig_intx_av_m1r.mat(mean)",
+  mar = c(0,0,1,0)
+)
+
+#STEP: PLOT: For each row within missing vars plot the imputation
+for (i in unique(mval$rows))
+{
+  colsi = as.vector(mval$cols[mval$rows == i])
+
+plot.mat = vector()
+for (h in 1:(dim(stornew.arr)[3]))
+{
+  row.vec = stornew.arr[i,colsi,h]
+  plot.mat = rbind(plot.mat,row.vec)
+}
+plot.mat = as.data.frame(plot.mat)
+rownames(plot.mat ) <- NULL
+
+#Make the plot
+#adjust plot margins
+par(mar = c(1, 1, 1, 1))
+hist(plot.mat)
+title = mvar$name[mvar$row == i]
+print(title)
+lower
+}
